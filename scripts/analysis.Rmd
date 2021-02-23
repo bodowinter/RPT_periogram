@@ -1,0 +1,287 @@
+---
+title: "Aviad & Stefan - Prominence analysis"
+author: "Bodo"
+date: "08/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocessing
+
+Load packages:
+
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(brms)
+```
+
+For reproducibility, print R package version into script:
+
+```{r}
+R.Version()
+packageVersion('tidyverse')
+packageVersion('brms')
+```
+
+Load data:
+
+```{r, warning = FALSE, message = FALSE}
+prom <- read_csv('../data/scores_df-fix.csv')
+
+# Check:
+
+prom
+```
+
+Load prominence scores from Baumann & Winter (2018) paper (one word of "zu" had to be deleted from the data frame as this was not in the new data that Aviad created).
+
+```{r, message = FALSE, warning = FALSE}
+pscores <- read_csv('../data/baumann_winter_2017_RPT_individual_processed.csv')
+```
+
+Check overlap between identifier variables between the two datasets just in case... to make sure that labels are consistent and that we got everything:
+
+```{r}
+# "Sentence" column across datasets:
+
+all(prom$Sentence %in% pscores$Sentence)
+all(pscores$Sentence %in% prom$Sentence)
+
+# "Word" column across datasets:
+
+all(prom$Word %in% pscores$Word)
+all(pscores$Word %in% prom$Word)
+
+# "Speaker" column across datasets:
+
+all(prom$Speaker %in% pscores$Speaker)
+all(pscores$Speaker %in% prom$Speaker)
+```
+
+Create a unique identifier variable out of these three things:
+
+```{r}
+prom <- mutate(prom,
+               unique_id = str_c(Speaker, '_', Sentence, '_', Word))
+
+pscores <- mutate(pscores,
+                  unique_id = str_c(Speaker, '_', Sentence, '_', Word))
+```
+
+See that they all match:
+
+```{r}
+all(prom$unique_id %in% pscores$unique_id)
+all(pscores$unique_id %in% prom$unique_id)
+```
+
+Match the two:
+
+```{r}
+both <- left_join(pscores, select(prom, -Word, -Speaker, -Sentence),
+                  by = c('unique_id' = 'unique_id'))
+```
+
+## Checking NAs
+
+Get all variable names from Aviad's data:
+
+```{r}
+all_vars <- select(both,
+                   scoreMax_synchrony:scoreMean_massXf0) %>%
+  colnames()
+```
+
+Do any of the variables contain NAs? Do this with summarize_all() and an anonymous helper function:
+
+```{r}
+both[, all_vars] %>% 
+  summarize_all(function(x) sum(is.na(x))) %>% 
+  print(width = Inf)
+```
+
+Which ones are the ones that have NAs?
+
+```{r}
+filter(prom, is.na(scoreMean_massXf0))
+```
+
+These are the ones that are NA for Aviad's measures. Only 18 data points, which is...
+
+```{r}
+nrow(filter(prom, is.na(scoreMean_massXf0))) / nrow(prom)
+```
+
+... only 3% of the total. Can surely be ignored.
+
+## Descriptive stats and data viz
+
+```{r}
+both %>% group_by(Prominence) %>% 
+  select(all_vars) %>% 
+  summarize_all(mean, na.rm = TRUE) %>% 
+  print(width = Inf)
+```
+
+Make a plot of scoreMean_massXf0:
+
+```{r}
+both %>% ggplot(aes(x = factor(Prominence), y = scoreMean_massXf0,
+                    fill = factor(Prominence))) +
+  geom_boxplot(alpha = 0.8) +
+  scale_fill_viridis_d(option = 'D') +
+  theme_minimal() +
+  theme(legend.position = '',
+        axis.title.x = element_blank())
+```
+
+## Standardize predictors
+
+For now, let's compare the new F0 mass to F0 mean and RMS amplitude... which are the two most-predictive acoustic variables from Baumann & Winter (2018). To compare the variables, we should z-score them:
+
+```{r}
+# Define scale helper function that ignores NAs:
+
+z_fnc <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+# (we don't use scale() because we hate it)
+
+# Z-score
+
+both <- mutate(both,
+               # aviad's variables:
+               
+               scoreMax_massXf0_z = z_fnc(scoreMax_massXf0),
+               scoreMean_massXf0_z = z_fnc(scoreMean_massXf0),
+               scoreMax_massXsync_z = z_fnc(scoreMax_massXsync),
+               scoreMean_massXsync_z = z_fnc(scoreMean_massXsync),
+               scoreMax_massXscale_z = z_fnc(scoreMax_massXscale),
+               scoreMean_massXscale_z = z_fnc(scoreMean_massXscale),
+               
+               # old variables:
+               
+               MeanPitch_z = z_fnc(MeanPitch),
+               RMS_norm_z = z_fnc(RMS_norm))
+```
+
+Create variable names:
+
+```{r}
+vars <- colnames(select(both, scoreMax_massXf0_z:RMS_norm_z))
+```
+
+
+## Setup for all Bayesian models
+
+For parallel processing:
+
+```{r}
+options(mc.cores=parallel::detectCores())
+```
+
+Set MCMC controls for convergence:
+
+```{r}
+mcmc_controls <- list(adapt_delta = 0.99,
+                      max_treedepth = 13)
+```
+
+Set weakly informative priors. For logistic regression SD = 1 should be fine (predicting Prominence).
+
+```{r}
+priors <- c(prior(normal(0, 1), class = b))
+```
+
+## Bayesian analysis:
+
+Loop through variable names and run the Bayesian models for each. First, we need to define the formulas for all of them:
+
+```{r}
+formulas <- str_c('Prominence ~ ', vars,
+                  '+ (1 + ', vars,
+                  '|Speaker) + (1|Sentence) + (1|Word)')
+```
+
+Check:
+
+```{r}
+formulas
+```
+
+Empty table to be filled with coefficients; empty table to be filled with posteriors; empty table to be filled with random slope coefficients for speaker variability.
+
+```{r}
+coefs <- c()
+coefs_posts <- c()
+slopes <- c()
+```
+
+
+Loop through and fit models:
+
+```{r}
+set.seed(666) # a nice comforting number
+
+for (i in seq_along(formulas)) {
+  this_mdl <- brm(formula = formulas[i],
+                  data = both,
+                  
+                  # Likelihood function:
+                  family = bernoulli,
+                  
+                  # Priors:
+                  prior = priors,
+                  
+                  # MCMC settings:
+                  init = 0, seed = 666,
+                  cores = 4, chains = 4,
+                  warmup = 3000, iter = 6000,
+                  control = mcmc_controls)
+  
+  # Save on hard drive:
+  
+  save(this_mdl,
+       file = str_c('../models/', str_c(vars[i], '_mdl'), '.Rdata'),
+       compress = 'xz', compression_level = 9)
+  
+  # Get the coefficients:
+  
+  this_coef <- fixef(this_mdl)[2, ]
+  this_coef <- t(as.data.frame(this_coef))
+  this_coef <- cbind(data.frame(coef = row.names(fixef(this_mdl))[2]), this_coef)
+  row.names(this_coef) <- c()
+  coefs <- rbind(coefs, this_coef)
+  
+  # Get the random effect summary estimates (speaker slopes):
+  
+  this_sum <- t(as.data.frame(summary(this_mdl)$random$Speaker[2, ]))
+  row.names(this_sum) <- c()
+  this_sum <- cbind(data.frame(coef = vars[i]), this_sum)
+  slopes <- rbind(slopes, this_sum)
+  
+  # Get the posteriors:
+  
+  this_posts <- posterior_samples(this_mdl)[, str_c('b_', vars[i])]
+  coefs_posts <- c(coefs_posts, this_posts)
+  
+  # Perform posterior predictive checks:
+  
+  this_pp <- pp_check(this_mdl, nsamples = 100)
+  ggsave(plot = this_pp, filename = str_c('../pp_checks/', vars[i], '_pp.pdf'),
+         width = 8, height = 6)
+  }
+```
+
+Write the coefficients to a table:
+
+```{r}
+write_csv(coefs, '../results/fixed_effect_coefficients.csv')
+write_csv(coefs_posts, '../results/fixed_effects_posteriors.csv')
+write_csv(slopes, '../results/random_slopes.csv')
+```
+
+
+
+
